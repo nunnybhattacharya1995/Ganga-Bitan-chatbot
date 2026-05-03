@@ -1,16 +1,25 @@
 import { supabase } from '@/lib/supabase'
-import { sendMessage } from '@/lib/whatsapp'
+import { sendMessage, sendButtonMessage, sendListMessage } from '@/lib/whatsapp'
 import { getAIReply } from '@/lib/openrouter'
 
 export const dynamic = 'force-dynamic'
 
+// ── Language detection ────────────────────────────────────────────────────────
 function detectLanguageChoice(text) {
   const t = (text || '').trim().toLowerCase()
-  if (t === '1' || t.includes('english')) return 'english'
-  if (t === '2' || t.includes('bengali') || t.includes('bangla') || t.includes('বাংলা')) return 'bengali'
+  if (t === '1' || t.includes('english') || t === 'lang_english') return 'english'
+  if (
+    t === '2' ||
+    t.includes('bengali') ||
+    t.includes('bangla') ||
+    t.includes('বাংলা') ||
+    t === 'lang_bengali'
+  )
+    return 'bengali'
   return null
 }
 
+// ── Booking completion detection ──────────────────────────────────────────────
 function isBookingComplete(text) {
   if (!text) return false
   const t = text.toLowerCase()
@@ -21,6 +30,60 @@ function isBookingComplete(text) {
   )
 }
 
+// ── Parse numbered options from AI text ──────────────────────────────────────
+// Returns { body, options: [{ num, title }] }
+function parseInteractive(text) {
+  const lines = text.split('\n')
+  const options = []
+  const bodyLines = []
+  let optionStarted = false
+
+  for (const line of lines) {
+    const match = line.match(/^\s*(\d+)[.)]\s+(.+)/)
+    if (match) {
+      options.push({
+        num: match[1],
+        title: match[2].replace(/\*|_|~/g, '').trim()
+      })
+      optionStarted = true
+    } else {
+      if (!optionStarted) bodyLines.push(line)
+    }
+  }
+
+  const body = bodyLines.join('\n').trim() || text
+  return { body, options }
+}
+
+// ── Send AI reply — auto-convert numbered options to buttons/list ─────────────
+async function sendAIReply(phone, aiReply) {
+  const { body, options } = parseInteractive(aiReply)
+
+  if (
+    options.length >= 2 &&
+    options.length <= 3 &&
+    options.every((o) => o.title.length <= 20)
+  ) {
+    // 2–3 short options → clickable buttons
+    await sendButtonMessage(
+      phone,
+      body,
+      options.map((o, i) => ({ id: `opt_${i + 1}`, title: o.title }))
+    )
+  } else if (options.length >= 2 && options.length <= 10) {
+    // 4–10 options → scrollable list
+    await sendListMessage(
+      phone,
+      body,
+      options.map((o, i) => ({ id: `opt_${i + 1}`, title: o.title }))
+    )
+  } else {
+    // No detected options (name step, summary, etc.) → plain text
+    await sendMessage(phone, aiReply)
+  }
+}
+
+// ── Webhook GET — Meta verification ──────────────────────────────────────────
 export async function GET(req) {
   const { searchParams } = new URL(req.url)
   const mode = searchParams.get('hub.mode')
@@ -33,6 +96,7 @@ export async function GET(req) {
   return new Response('Forbidden', { status: 403 })
 }
 
+// ── Webhook POST — incoming messages ─────────────────────────────────────────
 export async function POST(req) {
   try {
     const body = await req.json()
@@ -42,47 +106,58 @@ export async function POST(req) {
     const message = value?.messages?.[0]
 
     if (!message) return new Response('OK', { status: 200 })
-    if (message.type !== 'text') return new Response('OK', { status: 200 })
+
+    // Accept text AND interactive (button/list reply) messages
+    if (!['text', 'interactive'].includes(message.type)) {
+      return new Response('OK', { status: 200 })
+    }
 
     const phone = message.from
-    const text = message.text?.body || ''
     const waMessageId = message.id
 
-    // ---- Deduplication: skip if we've already processed this WhatsApp message ID ----
-    // (Meta retries the webhook if it doesn't get a fast 200, which causes duplicate replies.)
+    // Extract text from either a typed message or a button/list click
+    let text = ''
+    if (message.type === 'text') {
+      text = message.text?.body || ''
+    } else if (message.type === 'interactive') {
+      const ir = message.interactive
+      text = ir?.button_reply?.title || ir?.list_reply?.title || ''
+    }
+
+    // ── Deduplication ─────────────────────────────────────────────────────────
     if (waMessageId) {
       const { data: existing, error: dupErr } = await supabase
         .from('conversations')
         .select('id')
         .eq('wa_message_id', waMessageId)
         .maybeSingle()
-      if (dupErr) console.error('[dedupe lookup error]', dupErr.message)
+      if (dupErr) console.error('[dedupe error]', dupErr.message)
       if (existing) {
         console.log('[dedupe] skipping already-processed message', waMessageId)
         return new Response('OK', { status: 200 })
       }
     }
 
-    // ---- Check agent mode ----
+    // ── Agent mode check ──────────────────────────────────────────────────────
     const { data: modeRow, error: modeErr } = await supabase
       .from('agent_mode')
       .select('is_human')
       .eq('phone', phone)
       .maybeSingle()
-    if (modeErr) console.error('[agent_mode lookup error]', modeErr.message)
+    if (modeErr) console.error('[agent_mode error]', modeErr.message)
 
     if (modeRow?.is_human) {
-      const { error: convErr } = await supabase.from('conversations').insert({
+      const { error: e } = await supabase.from('conversations').insert({
         phone,
         role: 'user',
         message: text,
         wa_message_id: waMessageId
       })
-      if (convErr) console.error('[conversations insert error]', convErr.message)
+      if (e) console.error('[conversations insert error]', e.message)
       return new Response('OK', { status: 200 })
     }
 
-    // ---- Get or create guest (upsert handles race conditions) ----
+    // ── Get or create guest ───────────────────────────────────────────────────
     const { data: upsertedGuest, error: upsertErr } = await supabase
       .from('guests')
       .upsert({ phone }, { onConflict: 'phone', ignoreDuplicates: false })
@@ -92,7 +167,6 @@ export async function POST(req) {
 
     let guest = upsertedGuest
     if (!guest) {
-      // Fallback: re-select
       const { data: refetched } = await supabase
         .from('guests')
         .select('*')
@@ -102,25 +176,23 @@ export async function POST(req) {
     }
 
     if (!guest) {
-      console.error('[guest unavailable] DB likely missing tables. Run the SQL in lib/supabase.js.')
+      console.error('[guest unavailable] Run the SQL in lib/supabase.js first.')
       return new Response('OK', { status: 200 })
     }
 
-    // Detect "new conversation" by whether language was already set
     const isFirstContact = !guest.language
 
-    // ---- Save inbound user message ----
+    // ── Save inbound user message ─────────────────────────────────────────────
     const { error: userMsgErr } = await supabase.from('conversations').insert({
       phone,
       role: 'user',
       message: text,
       wa_message_id: waMessageId
     })
-    if (userMsgErr) console.error('[user message insert error]', userMsgErr.message)
+    if (userMsgErr) console.error('[user msg insert error]', userMsgErr.message)
 
-    // ---- First contact: send welcome + language picker, then return ----
+    // ── First contact: show language picker as interactive buttons ────────────
     if (isFirstContact) {
-      // Try to detect language from this very first message — saves a round trip
       const detectedLang = detectLanguageChoice(text)
       if (detectedLang) {
         await supabase.from('guests').update({ language: detectedLang }).eq('phone', phone)
@@ -131,19 +203,26 @@ export async function POST(req) {
           .from('agent_mode')
           .upsert({ phone, is_human: false, updated_at: new Date().toISOString() })
 
-        const welcomeMsg = `Welcome to *Ganga Bitan Family Inn* 🌿\nA luxury riverside resort on the Ganges.\n\nPlease choose your preferred language:\n\n*1*. English\n*2*. বাংলা (Bengali)\n\nReply with 1 or 2.`
+        const welcomeMsg =
+          'Welcome to *Ganga Bitan Family Inn* 🌿\nA luxury riverside resort on the Ganges.\n\nPlease choose your preferred language:'
 
         await supabase.from('conversations').insert({
           phone,
           role: 'assistant',
           message: welcomeMsg
         })
-        await sendMessage(phone, welcomeMsg)
+
+        // Send as 2 clickable buttons
+        await sendButtonMessage(phone, welcomeMsg, [
+          { id: 'lang_english', title: 'English' },
+          { id: 'lang_bengali', title: 'বাংলা (Bengali)' }
+        ])
+
         return new Response('OK', { status: 200 })
       }
     }
 
-    // ---- AI reply ----
+    // ── Build conversation history and get AI reply ───────────────────────────
     const { data: historyDesc } = await supabase
       .from('conversations')
       .select('role, message')
@@ -153,7 +232,10 @@ export async function POST(req) {
 
     const history = (historyDesc || [])
       .reverse()
-      .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.message }))
+      .map((m) => ({
+        role: m.role === 'assistant' ? 'assistant' : 'user',
+        content: m.message
+      }))
 
     const aiReply = await getAIReply(history, guest.language)
 
@@ -163,8 +245,10 @@ export async function POST(req) {
       message: aiReply
     })
 
-    await sendMessage(phone, aiReply)
+    // Send as interactive buttons/list if numbered options detected, else plain text
+    await sendAIReply(phone, aiReply)
 
+    // ── Owner notification on booking completion ──────────────────────────────
     if (isBookingComplete(aiReply)) {
       const owner = process.env.OWNER_WHATSAPP_NUMBER
       if (owner) {
