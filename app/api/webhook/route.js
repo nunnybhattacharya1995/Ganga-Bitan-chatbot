@@ -255,6 +255,22 @@ export async function POST(req) {
       await sendImageMessage(phone, roomMentioned.url, roomMentioned.caption)
     }
 
+    // ── Handle explicit photo requests e.g. "photo 1", "show aparupa" ─────────
+    const photoReq = text.toLowerCase()
+    if (photoReq.includes('photo') || photoReq.includes('image') || photoReq.includes('pic') || photoReq.includes('show')) {
+      const allRooms = ['aparupa ground', 'aparupa first', 'apsaraa', 'avisaar', 'abhilasha', 'ananya']
+      for (const key of allRooms) {
+        const { ROOM_IMAGES } = await import('@/lib/roomImages')
+        const room = ROOM_IMAGES[key]
+        if (photoReq.includes(key.split(' ')[0]) || (key === 'aparupa ground' && photoReq.includes('ground')) || (key === 'aparupa first' && (photoReq.includes('first') || photoReq.includes('1st')))) {
+          if (room && isImageReady(room)) {
+            await sendImageMessage(phone, room.url, room.caption)
+          }
+          break
+        }
+      }
+    }
+
     // ── Owner notification on booking completion ──────────────────────────────
     if (isBookingComplete(aiReply)) {
       const owner = process.env.OWNER_WHATSAPP_NUMBER
