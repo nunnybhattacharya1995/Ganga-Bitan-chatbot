@@ -1,6 +1,7 @@
 import { supabase } from '@/lib/supabase'
-import { sendMessage, sendButtonMessage, sendListMessage } from '@/lib/whatsapp'
+import { sendMessage, sendButtonMessage, sendListMessage, sendImageMessage } from '@/lib/whatsapp'
 import { getAIReply } from '@/lib/openrouter'
+import { detectRoomMention, isImageReady } from '@/lib/roomImages'
 
 export const dynamic = 'force-dynamic'
 
@@ -247,6 +248,12 @@ export async function POST(req) {
 
     // Send as interactive buttons/list if numbered options detected, else plain text
     await sendAIReply(phone, aiReply)
+
+    // ── Send room image if a specific room is mentioned ───────────────────────
+    const roomMentioned = detectRoomMention(aiReply) || detectRoomMention(text)
+    if (roomMentioned && isImageReady(roomMentioned)) {
+      await sendImageMessage(phone, roomMentioned.url, roomMentioned.caption)
+    }
 
     // ── Owner notification on booking completion ──────────────────────────────
     if (isBookingComplete(aiReply)) {
